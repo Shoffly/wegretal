@@ -184,13 +184,27 @@ def analyze_campaign_data(client, audience_df):
         min_sent_date = audience_df['Sent Date'].min() - timedelta(days=7)
         max_sent_date = audience_df['Sent Date'].max() + timedelta(days=7)
 
-        # Query all activity data at once
-        activity_query = f"""
+        # First, get all possible action types
+        action_types_query = """
+        SELECT DISTINCT action_name
+        FROM reporting.retail_user_activity
+        """
+
+        action_types_df = client.query(action_types_query).to_dataframe()
+        all_possible_actions = action_types_df['action_name'].tolist()
+
+        # Query all activity data at once with detailed information
+        activity_query = """
         SELECT 
             client_id,
             action_date,
             action_name,
-            COUNT(*) as action_count
+            COUNT(*) as action_count,
+            STRING_AGG(DISTINCT sf_car_name) as car_names,
+            STRING_AGG(DISTINCT vehicle_make) as makes,
+            STRING_AGG(DISTINCT vehicle_model) as models,
+            STRING_AGG(DISTINCT vehicle_body_style) as body_styles,
+            AVG(vehicle_kilometers) as avg_kilometers
         FROM reporting.retail_user_activity
         WHERE client_id IN UNNEST(@user_ids)
         AND action_date BETWEEN @min_date AND @max_date
@@ -251,26 +265,73 @@ def analyze_campaign_data(client, audience_df):
                 'Total Conversions': row.get('Total Conversions', 0)
             }
 
-            # Get all unique actions for this user
-            all_actions = pd.concat([
-                before_data['action_name'] if not before_data.empty else pd.Series(),
-                after_data['action_name'] if not after_data.empty else pd.Series()
-            ]).unique()
+            # Initialize counts for all possible actions
+            for action in all_possible_actions:
+                result[f'{action} (Before)'] = 0
+                result[f'{action} (After)'] = 0
+                result[f'{action} (Change)'] = 0
 
-            # Calculate metrics for each action
-            for action in all_actions:
-                before_count = before_data[before_data['action_name'] == action][
-                    'action_count'].sum() if not before_data.empty else 0
-                after_count = after_data[after_data['action_name'] == action][
-                    'action_count'].sum() if not after_data.empty else 0
+            # Calculate metrics for actual actions in before period
+            if not before_data.empty:
+                for action_name, group in before_data.groupby('action_name'):
+                    result[f'{action_name} (Before)'] = group['action_count'].sum()
+                    # Add detailed metrics for important actions
+                    if action_name in ['financing_request', 'test_drive_request', 'buy_now_request']:
+                        result[f'{action_name}_cars_before'] = group['car_names'].iloc[0]
+                        result[f'{action_name}_makes_before'] = group['makes'].iloc[0]
+                        result[f'{action_name}_models_before'] = group['models'].iloc[0]
 
-                result[f'{action} (Before)'] = before_count
-                result[f'{action} (After)'] = after_count
+            # Calculate metrics for actual actions in after period
+            if not after_data.empty:
+                for action_name, group in after_data.groupby('action_name'):
+                    result[f'{action_name} (After)'] = group['action_count'].sum()
+                    # Add detailed metrics for important actions
+                    if action_name in ['financing_request', 'test_drive_request', 'buy_now_request']:
+                        result[f'{action_name}_cars_after'] = group['car_names'].iloc[0]
+                        result[f'{action_name}_makes_after'] = group['makes'].iloc[0]
+                        result[f'{action_name}_models_after'] = group['models'].iloc[0]
+
+            # Calculate changes for all actions
+            for action in all_possible_actions:
+                before_count = result.get(f'{action} (Before)', 0)
+                after_count = result.get(f'{action} (After)', 0)
                 result[f'{action} (Change)'] = after_count - before_count
 
             results.append(result)
 
-        return pd.DataFrame(results)
+        results_df = pd.DataFrame(results)
+
+        # Add summary columns for important metrics
+        results_df['Total Actions Before'] = sum(
+            results_df[col] for col in results_df.columns if col.endswith('(Before)')
+        )
+        results_df['Total Actions After'] = sum(
+            results_df[col] for col in results_df.columns if col.endswith('(After)')
+        )
+        results_df['Total Action Change'] = results_df['Total Actions After'] - results_df['Total Actions Before']
+
+        # Calculate engagement score
+        action_weights = {
+            'financing_request': 5,
+            'test_drive_request': 4,
+            'buy_now_request': 4,
+            'car_viewed': 1,
+            'search_performed': 1
+        }
+
+        for period in ['Before', 'After']:
+            score = 0
+            for action, weight in action_weights.items():
+                col_name = f'{action} ({period})'
+                if col_name in results_df.columns:
+                    score += results_df[col_name] * weight
+            results_df[f'Engagement Score ({period})'] = score
+
+        results_df['Engagement Score Change'] = (
+                results_df['Engagement Score (After)'] - results_df['Engagement Score (Before)']
+        )
+
+        return results_df
 
     except Exception as e:
         st.error(f"Error in analyze_campaign_data: {str(e)}")
@@ -360,27 +421,70 @@ def main():
                 total_conversions = results_df['Total Conversions'].sum()
                 st.metric("Total Conversions", total_conversions)
             with col4:
-                conversion_rate = (total_conversions / len(results_df)) * 100 if len(results_df) > 0 else 0
-                st.metric("Conversion Rate", f"{conversion_rate:.1f}%")
+                avg_engagement_change = results_df['Engagement Score Change'].mean()
+                st.metric("Avg Engagement Change", f"{avg_engagement_change:.1f}")
 
             # Action metrics
             st.subheader("Action Metrics")
 
-            # Get all action columns
-            action_columns = [col for col in results_df.columns if '(Change)' in col]
+            # Create tabs for different types of analysis
+            tab1, tab2, tab3 = st.tabs(["General Actions", "Important Actions", "Engagement Analysis"])
 
-            for action_col in action_columns:
-                action_name = action_col.replace(' (Change)', '')
-                total_before = results_df[f'{action_name} (Before)'].sum()
-                total_after = results_df[f'{action_name} (After)'].sum()
-                change = results_df[action_col].sum()
-                change_pct = ((total_after - total_before) / total_before * 100) if total_before > 0 else 0
+            with tab1:
+                # Get all action columns
+                action_columns = [col for col in results_df.columns if '(Change)' in col]
 
-                st.metric(
-                    action_name,
-                    f"{total_after:,} (After) vs {total_before:,} (Before)",
-                    f"{change:+,} ({change_pct:+.1f}%)"
+                for action_col in action_columns:
+                    action_name = action_col.replace(' (Change)', '')
+                    total_before = results_df[f'{action_name} (Before)'].sum()
+                    total_after = results_df[f'{action_name} (After)'].sum()
+                    change = results_df[action_col].sum()
+                    change_pct = ((total_after - total_before) / total_before * 100) if total_before > 0 else 0
+
+                    st.metric(
+                        action_name,
+                        f"{total_after:,} (After) vs {total_before:,} (Before)",
+                        f"{change:+,} ({change_pct:+.1f}%)"
+                    )
+
+            with tab2:
+                important_actions = ['financing_request', 'test_drive_request', 'buy_now_request']
+                for action in important_actions:
+                    if f'{action} (Before)' in results_df.columns:
+                        st.subheader(f"{action.replace('_', ' ').title()}")
+
+                        # Show metrics
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            total_before = results_df[f'{action} (Before)'].sum()
+                            total_after = results_df[f'{action} (After)'].sum()
+                            st.metric(
+                                "Total Requests",
+                                f"{total_after:,} (After) vs {total_before:,} (Before)",
+                                f"{total_after - total_before:+,}"
+                            )
+
+                        with col2:
+                            # Show most common makes/models
+                            if f'{action}_makes_after' in results_df.columns:
+                                makes_after = results_df[f'{action}_makes_after'].dropna()
+                                if not makes_after.empty:
+                                    st.write("Most Common Makes (After):")
+                                    st.write(makes_after.value_counts().head())
+
+            with tab3:
+                # Show engagement score distribution
+                fig = px.histogram(
+                    results_df,
+                    x='Engagement Score Change',
+                    title='Distribution of Engagement Score Changes'
                 )
+                st.plotly_chart(fig)
+
+                # Show average engagement by message status
+                avg_engagement = results_df.groupby('Message Status')['Engagement Score Change'].mean()
+                st.write("Average Engagement Change by Message Status:")
+                st.write(avg_engagement)
 
             # Detailed results table
             st.subheader("Detailed Results")
