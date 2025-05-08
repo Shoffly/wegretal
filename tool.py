@@ -539,7 +539,7 @@ def analyze_campaign_data(client, audience_df):
 
         # Add booking analysis
         if not booking_df.empty:
-           
+
 
             # Attribution changes
             st.subheader("Attribution Changes")
