@@ -170,7 +170,78 @@ def get_booking_attribution(client, user_ids, min_date, max_date):
     Get booking attribution data for the specified users and date range.
     """
     attribution_query = """
-    WITH booking_data AS (
+    WITH google_marketing as (
+        SELECT DISTINCT
+            `campaigns`.`campaign_id`,
+            `campaigns`.`campaign_name`,
+            `campaigns`.`campaign_bidding_strategy_type`,
+            `ads`.`ad_group_id`,
+            `ads`.`ad_group_base_ad_group`,
+            `ads`.`ad_group_ad_ad_id`,
+            `ads`.`ad_group_ad_ad_group`
+        FROM `pricing-338819`.`google_marketing`.`ads_Campaign_7482252258` AS `campaigns`
+        LEFT JOIN `pricing-338819`.`google_marketing`.`ads_AdStats_7482252258` AS `ads`
+        ON `campaigns`.`campaign_id` = `ads`.`campaign_id`
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY `campaigns`.`campaign_id` ORDER BY `campaigns`.`_DATA_DATE` DESC) =1
+    ),
+
+    user_sessions AS (
+        SELECT
+            `thank_you_page`.`bookingId` AS `booking_id`,
+            `session_start`.`user_pseudo_id`,
+            COALESCE(session_start.userId, `thank_you_page`.`userId`) AS `user_id`,
+            TIMESTAMP_MICROS(`session_start`.`event_timestamp`) AS `session_timestamp`,
+            `session_start`.`ga_session_id`,
+            LOWER(CASE
+                WHEN LOWER(`session_start`.`source`) LIKE "%facebook%" THEN "Facebook"
+                WHEN LOWER(`session_start`.`source`) LIKE "%facbook%" THEN "Facebook"
+                WHEN LOWER(`session_start`.`source`) LIKE "%instagram%" THEN "Instagram"
+                WHEN LOWER(`session_start`.`source`) LIKE "%youtube%" THEN "Youtube"
+                WHEN LOWER(`session_start`.`source`) LIKE "%linkedin%" THEN "LinkedIn"
+                WHEN LOWER(`session_start`.`source`) LIKE "%lnkd%" THEN "LinkedIn"
+                WHEN LOWER(`session_start`.`source`) LIKE "%whatsapp%" THEN "Whatsapp"
+                WHEN LOWER(`session_start`.`source`) LIKE "%messenger.com%" THEN "Facebook"
+                WHEN LOWER(`session_start`.`source`) LIKE "%google%" THEN "Google"
+                ELSE `session_start`.`source`
+            END) AS `source`,
+            LOWER(`session_start`.`medium`) AS `medium`,
+            LOWER(`session_start`.`campaign`) AS `campaign`,
+            CASE
+                WHEN `new_campaign`.`campaign_id` IS NOT NULL THEN "Facebook"
+                WHEN `google_campaign_sessions`.`campaign_id` IS NOT NULL THEN "Google"
+                ELSE "Organic"
+            END AS `marketing_channel`
+        FROM `pricing-338819`.`google_analytics`.`session_start` AS `session_start`
+        LEFT JOIN `pricing-338819`.`google_analytics`.`screen_thank_you_page` AS `thank_you_page`
+            USING(`user_pseudo_id`, `ga_session_id`)
+        LEFT JOIN `pricing-338819`.`facebook_marketing`.`meta_historical_campaigns` AS `meta_history`
+            ON REGEXP_EXTRACT(meta_history.url, r'[?&]utm_campaign=([^&]+)') = 
+               REGEXP_EXTRACT(session_start.page_location, r'[?&]utm_campaign=([^&]+)')
+        LEFT JOIN google_marketing AS `google_campaign_sessions`
+            ON `session_start`.`campaign` = `google_campaign_sessions`.`campaign_name`
+            OR `session_start`.`campaign_id` = CAST(`google_campaign_sessions`.`campaign_id` AS STRING)
+        LEFT JOIN `pricing-338819`.`facebook_marketing`.`ad_metadata` AS `new_campaign`
+            ON CASE
+                WHEN STRPOS(`session_start`.`campaign`, '.') > 0 THEN SPLIT(`session_start`.`campaign`, '.')[SAFE_OFFSET(1)]
+                ELSE NULL
+            END = SAFE_CAST(`new_campaign`.`id` AS STRING)
+            OR `meta_history`.`ad_id`=`new_campaign`.`id`
+        WHERE `session_start`.`event_timestamp` IS NOT NULL
+        AND REGEXP_CONTAINS(
+            SPLIT(`session_start`.`page_location`, "?")[OFFSET(0)],
+            r"buy-used-cars|car-details|car-listing|car-profile|car-type|checkout|confirm|confirmed|get-vehicle-info|otp|otp-verify"
+        )
+    ),
+
+    social_users AS (
+        SELECT DISTINCT user_id
+        FROM user_sessions
+        WHERE marketing_channel = 'Facebook'
+        AND session_timestamp BETWEEN @min_date AND @max_date
+        AND user_id IS NOT NULL
+    ),
+
+    booking_data AS (
         SELECT 
             rb.client_id,
             rb.client_phone_number,
@@ -203,6 +274,7 @@ def get_booking_attribution(client, user_ids, min_date, max_date):
             ON PM.booking_id = rb.booking_id
         WHERE rb.client_id IN UNNEST(@user_ids)
         AND rb.booking_created_at BETWEEN @min_date AND @max_date
+        AND rb.client_id NOT IN (SELECT user_id FROM social_users)  -- Exclude users who came from social during campaign
     ),
     recency_data AS (
         SELECT 
@@ -267,6 +339,171 @@ def analyze_campaign_data(client, audience_df):
         # Get the overall date range needed
         min_sent_date = audience_df['Sent Date'].min() - timedelta(days=7)
         max_sent_date = audience_df['Sent Date'].max() + timedelta(days=7)
+
+        # First, identify users who came from social/google during campaign period using the exact query
+        social_query = """
+        WITH `google_marketing` as (
+            SELECT DISTINCT
+                `campaigns`.`campaign_id`,
+                `campaigns`.`campaign_name`,
+                `campaigns`.`campaign_bidding_strategy_type`,
+                `ads`.`ad_group_id`,
+                `ads`.`ad_group_base_ad_group`,
+                `ads`.`ad_group_ad_ad_id`,
+                `ads`.`ad_group_ad_ad_group`
+            FROM `pricing-338819`.`google_marketing`.`ads_Campaign_7482252258` AS `campaigns`
+            LEFT JOIN `pricing-338819`.`google_marketing`.`ads_AdStats_7482252258` AS `ads`
+            ON `campaigns`.`campaign_id` = `ads`.`campaign_id`
+            QUALIFY ROW_NUMBER() OVER (PARTITION BY `campaigns`.`campaign_id` ORDER BY `campaigns`.`_DATA_DATE` DESC) =1
+        ),
+        `user_sessions` AS (
+            SELECT
+                `thank_you_page`.`bookingId` AS `booking_id`,
+                `session_start`.`user_pseudo_id`,
+                COALESCE(session_start.userId, `thank_you_page`.`userId`) AS `user_id`,
+                TIMESTAMP_MICROS(`session_start`.`event_timestamp`) AS `session_timestamp`,
+                `session_start`.`ga_session_id`,
+                LOWER(CASE
+                    WHEN LOWER(`session_start`.`source`) LIKE "%facebook%" THEN "Facebook"
+                    WHEN LOWER(`session_start`.`source`) LIKE "%facbook%" THEN "Facebook"
+                    WHEN LOWER(`session_start`.`source`) LIKE "%duckduckgo%" THEN "DuckDuckGo"
+                    WHEN LOWER(`session_start`.`source`) LIKE "%yahoo%" THEN "Yahoo"
+                    WHEN LOWER(`session_start`.`source`) LIKE "%baidu%" THEN "Baidu"
+                    WHEN LOWER(`session_start`.`source`) LIKE "%instagram%" THEN "Instagram"
+                    WHEN LOWER(`session_start`.`source`) LIKE "%youtube%" THEN "Youtube"
+                    WHEN LOWER(`session_start`.`source`) LIKE "%linkedin%" THEN "LinkedIn"
+                    WHEN LOWER(`session_start`.`source`) LIKE "%lnkd%" THEN "LinkedIn"
+                    WHEN LOWER(`session_start`.`source`) LIKE "%whatsapp%" THEN "Whatsapp"
+                    WHEN LOWER(`session_start`.`source`) LIKE "%bing%" THEN "Bing"
+                    WHEN LOWER(`session_start`.`source`) LIKE "%googlesyndication%" THEN "Google"
+                    WHEN LOWER(`session_start`.`source`) LIKE "%googleapis%" THEN "Google"
+                    WHEN LOWER(`session_start`.`source`) LIKE "%google%" THEN "Google"
+                    WHEN LOWER(`session_start`.`source`) LIKE "%messenger.com%" THEN "Facebook"
+                    ELSE `session_start`.`source`
+                END) AS `source`,
+                LOWER(`session_start`.`medium`) AS `medium`,
+                LOWER(`session_start`.`campaign`) AS `campaign`,
+                COALESCE(`session_start`.`utm_source`, REGEXP_EXTRACT(
+                    (SELECT SAFE_CONVERT_BYTES_TO_STRING(ARRAY_TO_STRING(ARRAY_AGG(IF(STARTS_WITH(`y`, '%'),FROM_HEX(SUBSTR(`y`, 2)),CAST(`y` AS BYTES)) ORDER BY `i`),b''))
+                    FROM UNNEST(REGEXP_EXTRACT_ALL(session_start.page_location, r'%[0-9a-fA-F]{2}|[^%]+')) AS `y` WITH OFFSET AS `i`
+                ), r'[?&]utm_source=([^&]+)')) AS `utm_source`,
+                COALESCE(`session_start`.`utm_medium`, REGEXP_EXTRACT(
+                    (SELECT SAFE_CONVERT_BYTES_TO_STRING(ARRAY_TO_STRING(ARRAY_AGG(IF(STARTS_WITH(`y`, '%'),FROM_HEX(SUBSTR(`y`, 2)),CAST(`y` AS BYTES)) ORDER BY `i`),b''))
+                    FROM UNNEST(REGEXP_EXTRACT_ALL(session_start.page_location, r'%[0-9a-fA-F]{2}|[^%]+')) AS `y` WITH OFFSET AS `i`
+                ), r'[?&]utm_medium=([^&]+)')) AS `utm_medium`,
+                COALESCE(`session_start`.`utm_campaign`, REGEXP_EXTRACT(
+                    (SELECT SAFE_CONVERT_BYTES_TO_STRING(ARRAY_TO_STRING(ARRAY_AGG(IF(STARTS_WITH(`y`, '%'),FROM_HEX(SUBSTR(`y`, 2)),CAST(`y` AS BYTES)) ORDER BY `i`),b''))
+                    FROM UNNEST(REGEXP_EXTRACT_ALL(session_start.page_location, r'%[0-9a-fA-F]{2}|[^%]+')) AS `y` WITH OFFSET AS `i`
+                ), r'[?&]utm_campaign=([^&]+)')) AS `utm_campaign`,
+                COALESCE(`session_start`.`utm_campaign_id`, REGEXP_EXTRACT(
+                    (SELECT SAFE_CONVERT_BYTES_TO_STRING(ARRAY_TO_STRING(ARRAY_AGG(IF(STARTS_WITH(`y`, '%'),FROM_HEX(SUBSTR(`y`, 2)),CAST(`y` AS BYTES)) ORDER BY `i`),b''))
+                    FROM UNNEST(REGEXP_EXTRACT_ALL(session_start.page_location, r'%[0-9a-fA-F]{2}|[^%]+')) AS `y` WITH OFFSET AS `i`
+                ), r'[?&]utm_id=([^&]+)')) AS `utm_campaign_id`,
+                CASE
+                    WHEN `new_campaign`.`campaign_id` IS NOT NULL THEN "Facebook"
+                    WHEN `google_campaign_sessions`.`campaign_id` IS NOT NULL THEN "Google"
+                    ELSE "Organic"
+                END AS `marketing_channel`,
+                COALESCE(`new_campaign`.`campaign_id`,`google_campaign_sessions`.`campaign_id`) AS `campaign_id`,
+                CASE WHEN `session_start`.`medium` = "CPC" THEN "Buy - Performance Max"
+                    ELSE COALESCE(`google_campaign_sessions`.`campaign_name`,`new_campaign`.`campaign_name`)
+                END AS `campaign_name`,
+                COALESCE(`new_campaign`.`adset_id`,`google_campaign_sessions`.`ad_group_id`) AS `adset_id`,
+                COALESCE(`new_campaign`.`adset_name`,`google_campaign_sessions`.`ad_group_base_ad_group`) AS `adset_name`,
+                COALESCE(`new_campaign`.`id`,`google_campaign_sessions`.`ad_group_ad_ad_id`)AS `ad_id`,
+                COALESCE(`new_campaign`.`name`,`google_campaign_sessions`.`ad_group_ad_ad_group`) AS `ad_name`
+            FROM `pricing-338819`.`google_analytics`.`session_start` AS `session_start`
+            LEFT JOIN `pricing-338819`.`google_analytics`.`screen_thank_you_page` AS `thank_you_page`
+                USING(`user_pseudo_id`, `ga_session_id`)
+            LEFT JOIN `pricing-338819`.`facebook_marketing`.`meta_historical_campaigns` AS `meta_history`
+                ON REGEXP_EXTRACT(
+                    (SELECT SAFE_CONVERT_BYTES_TO_STRING(ARRAY_TO_STRING(ARRAY_AGG(IF(STARTS_WITH(`y`, '%'),FROM_HEX(SUBSTR(`y`, 2)),CAST(`y` AS BYTES)) ORDER BY `i`),b''))
+                    FROM UNNEST(REGEXP_EXTRACT_ALL(meta_history.url, r'%[0-9a-fA-F]{2}|[^%]+')) AS `y` WITH OFFSET AS `i`
+                ), r'[?&]utm_campaign=([^&]+)') = 
+                REGEXP_EXTRACT(
+                    (SELECT SAFE_CONVERT_BYTES_TO_STRING(ARRAY_TO_STRING(ARRAY_AGG(IF(STARTS_WITH(`y`, '%'),FROM_HEX(SUBSTR(`y`, 2)),CAST(`y` AS BYTES)) ORDER BY `i`),b''))
+                    FROM UNNEST(REGEXP_EXTRACT_ALL(session_start.page_location, r'%[0-9a-fA-F]{2}|[^%]+')) AS `y` WITH OFFSET AS `i`
+                ), r'[?&]utm_campaign=([^&]+)')
+            LEFT JOIN `google_marketing` AS `google_campaign_sessions`
+                ON `session_start`.`campaign` = `google_campaign_sessions`.`campaign_name`
+                OR `session_start`.`campaign_id` = CAST(`google_campaign_sessions`.`campaign_id` AS STRING)
+                OR COALESCE(`session_start`.`utm_campaign`, REGEXP_EXTRACT(
+                    (SELECT SAFE_CONVERT_BYTES_TO_STRING(ARRAY_TO_STRING(ARRAY_AGG(IF(STARTS_WITH(`y`, '%'),FROM_HEX(SUBSTR(`y`, 2)),CAST(`y` AS BYTES)) ORDER BY `i`),b''))
+                    FROM UNNEST(REGEXP_EXTRACT_ALL(session_start.page_location, r'%[0-9a-fA-F]{2}|[^%]+')) AS `y` WITH OFFSET AS `i`
+                ), r'[?&]utm_campaign=([^&]+)')) = `google_campaign_sessions`.`campaign_name`
+                OR COALESCE(`session_start`.`utm_campaign_id`, REGEXP_EXTRACT(
+                    (SELECT SAFE_CONVERT_BYTES_TO_STRING(ARRAY_TO_STRING(ARRAY_AGG(IF(STARTS_WITH(`y`, '%'),FROM_HEX(SUBSTR(`y`, 2)),CAST(`y` AS BYTES)) ORDER BY `i`),b''))
+                    FROM UNNEST(REGEXP_EXTRACT_ALL(session_start.page_location, r'%[0-9a-fA-F]{2}|[^%]+')) AS `y` WITH OFFSET AS `i`
+                ), r'[?&]utm_id=([^&]+)')) = CAST(`google_campaign_sessions`.`campaign_id` AS STRING)
+            LEFT JOIN `pricing-338819`.`facebook_marketing`.`ad_metadata` AS `new_campaign`
+                ON CASE
+                    WHEN STRPOS(`session_start`.`campaign`, '.') > 0 THEN SPLIT(`session_start`.`campaign`, '.')[SAFE_OFFSET(1)]
+                    WHEN STRPOS(COALESCE(`session_start`.`utm_campaign`,
+                        REGEXP_EXTRACT(
+                            (SELECT SAFE_CONVERT_BYTES_TO_STRING(ARRAY_TO_STRING(ARRAY_AGG(IF(STARTS_WITH(`y`, '%'),FROM_HEX(SUBSTR(`y`, 2)),CAST(`y` AS BYTES)) ORDER BY `i`),b''))
+                            FROM UNNEST(REGEXP_EXTRACT_ALL(session_start.page_location, r'%[0-9a-fA-F]{2}|[^%]+')) AS `y` WITH OFFSET AS `i`
+                        ), r'[?&]utm_campaign=([^&]+)')), '.') > 0 
+                        THEN SPLIT(COALESCE(`session_start`.`utm_campaign`,
+                            REGEXP_EXTRACT(
+                                (SELECT SAFE_CONVERT_BYTES_TO_STRING(ARRAY_TO_STRING(ARRAY_AGG(IF(STARTS_WITH(`y`, '%'),FROM_HEX(SUBSTR(`y`, 2)),CAST(`y` AS BYTES)) ORDER BY `i`),b''))
+                                FROM UNNEST(REGEXP_EXTRACT_ALL(session_start.page_location, r'%[0-9a-fA-F]{2}|[^%]+')) AS `y` WITH OFFSET AS `i`
+                            ), r'[?&]utm_campaign=([^&]+)')), '.')[SAFE_OFFSET(1)]
+                    ELSE NULL
+                END = SAFE_CAST(`new_campaign`.`id` AS STRING)
+                OR `meta_history`.`ad_id`=`new_campaign`.`id`
+            WHERE `session_start`.`event_timestamp` IS NOT NULL
+            AND REGEXP_CONTAINS(
+                SPLIT(`session_start`.`page_location`, "?")[OFFSET(0)],
+                r"buy-used-cars|car-details|car-listing|car-profile|car-type|checkout|confirm|confirmed|get-vehicle-info|otp|otp-verify"
+            )
+            AND session_start.event_date >= '2025-05-01'
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY
+                    `session_start`.`user_pseudo_id`,
+                    `thank_you_page`.`bookingId`
+                ORDER BY
+                    `thank_you_page`.`event_timestamp`
+            ) = 1
+        )
+        SELECT 
+            `user_sessions`.user_id,
+            `user_sessions`.session_timestamp,
+            `user_sessions`.marketing_channel
+        FROM `user_sessions`
+        WHERE `user_sessions`.marketing_channel IN ('Facebook', 'Google') 
+        AND user_id is not null
+        AND session_timestamp BETWEEN @min_date AND @max_date
+        AND user_id IN UNNEST(@user_ids)
+        """
+
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ArrayQueryParameter("user_ids", "STRING", user_ids),
+                bigquery.ScalarQueryParameter("min_date", "TIMESTAMP", min_sent_date),
+                bigquery.ScalarQueryParameter("max_date", "TIMESTAMP", max_sent_date),
+            ]
+        )
+
+        # Get users who came from social/google
+        social_users_df = client.query(social_query, job_config=job_config).to_dataframe()
+        social_users = social_users_df['user_id'].tolist()
+
+        # Remove these users from our audience dataframe
+        audience_df = audience_df[~audience_df['User ID'].isin(social_users)]
+
+        if len(social_users) > 0:
+            st.warning(f"""
+            ⚠️ Removed {len(social_users)} users who had both SMS and social/google attribution during the campaign period:
+            - Original users in campaign: {total_users}
+            - Users after removing social/google overlap: {len(audience_df)}
+            """)
+
+        # Update user_ids list after removing social users
+        user_ids = audience_df['User ID'].unique().tolist()
+
+        if not user_ids:
+            st.warning("No users remaining after removing social/google overlap")
+            return pd.DataFrame()
 
         # First, verify which users exist in retail_user_activity
         verification_query = """
@@ -539,7 +776,30 @@ def analyze_campaign_data(client, audience_df):
 
         # Add booking analysis
         if not booking_df.empty:
+            # Attribution distribution
+            st.subheader("Booking Attribution Analysis")
 
+            col1, col2 = st.columns(2)
+
+            with col1:
+                # Before campaign
+                before_attribution = results_df['Attribution Before'].value_counts()
+                fig1 = px.pie(
+                    values=before_attribution.values,
+                    names=before_attribution.index,
+                    title="Attribution Distribution (Before Campaign)"
+                )
+                st.plotly_chart(fig1)
+
+            with col2:
+                # After campaign
+                after_attribution = results_df['Attribution After'].value_counts()
+                fig2 = px.pie(
+                    values=after_attribution.values,
+                    names=after_attribution.index,
+                    title="Attribution Distribution (After Campaign)"
+                )
+                st.plotly_chart(fig2)
 
             # Attribution changes
             st.subheader("Attribution Changes")
@@ -724,4 +984,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main() 
