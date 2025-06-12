@@ -32,6 +32,7 @@ CREDENTIALS = {
     "mohanad.elgarhy@sylndr.com": hashlib.sha256("sylndr123".encode()).hexdigest(),
 }
 
+
 def check_password():
     """Returns `True` if the user had the correct password."""
 
@@ -42,7 +43,7 @@ def check_password():
             st.session_state["username"]]:
             st.session_state["password_correct"] = True
             st.session_state["current_user"] = st.session_state["username"]  # Store the username
-            
+
             # First identify the user
             posthog.identify(
                 st.session_state["username"],  # Use email as distinct_id
@@ -52,7 +53,7 @@ def check_password():
                     'last_login': datetime.now().isoformat()
                 }
             )
-            
+
             # Then capture the login event
             posthog.capture(
                 st.session_state["username"],
@@ -63,7 +64,7 @@ def check_password():
                     'success': True
                 }
             )
-            
+
             del st.session_state["password"]  # Don't store the password
             del st.session_state["username"]  # Don't store the username
         else:
@@ -95,6 +96,7 @@ def check_password():
 
     return False
 
+
 def clean_audience_data(df):
     """
     Clean and validate the audience data.
@@ -102,19 +104,19 @@ def clean_audience_data(df):
     """
     # Make a copy to avoid modifying the original
     df = df.copy()
-    
+
     # Clean column names - remove any whitespace and special characters
     df.columns = df.columns.str.strip()
-    
+
     # Ensure required columns exist
     required_columns = ['User ID', 'Sent Date']
     missing_columns = [col for col in required_columns if col not in df.columns]
     if missing_columns:
         raise ValueError(f"Missing required columns: {', '.join(missing_columns)}")
-    
+
     # Clean User IDs
     df['User ID'] = df['User ID'].astype(str).str.strip()
-    
+
     # Parse dates - try multiple formats
     def parse_date(date_str):
         date_formats = [
@@ -124,43 +126,44 @@ def clean_audience_data(df):
             "%d/%m/%Y",
             "%m/%d/%Y"
         ]
-        
+
         if pd.isna(date_str):
             return None
-        
+
         date_str = str(date_str).strip()
-        
+
         for fmt in date_formats:
             try:
                 return pd.to_datetime(date_str, format=fmt)
             except (ValueError, TypeError):
                 continue
-        
+
         try:
             # Try pandas default parser as last resort
             return pd.to_datetime(date_str)
         except (ValueError, TypeError):
             return None
-    
+
     df['Sent Date'] = df['Sent Date'].apply(parse_date)
-    
+
     # Remove rows with invalid dates
     invalid_dates = df['Sent Date'].isna()
     if invalid_dates.any():
         st.warning(f"Removed {invalid_dates.sum()} rows with invalid dates")
         df = df[~invalid_dates]
-    
+
     # Ensure we have valid data
     if len(df) == 0:
         raise ValueError("No valid data rows after cleaning")
-    
+
     # Convert numeric columns if they exist
     numeric_columns = ['Total Clicks', 'Total Conversions']
     for col in numeric_columns:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-    
+
     return df
+
 
 def get_booking_attribution(client, user_ids, min_date, max_date):
     """
@@ -305,7 +308,7 @@ def get_booking_attribution(client, user_ids, min_date, max_date):
         COUNT(*) OVER(PARTITION BY client_id) as total_bookings
     FROM recency_data
     """
-    
+
     job_config = bigquery.QueryJobConfig(
         query_parameters=[
             bigquery.ArrayQueryParameter("user_ids", "STRING", user_ids),
@@ -313,8 +316,9 @@ def get_booking_attribution(client, user_ids, min_date, max_date):
             bigquery.ScalarQueryParameter("max_date", "TIMESTAMP", max_date),
         ]
     )
-    
+
     return client.query(attribution_query, job_config=job_config).to_dataframe()
+
 
 def analyze_campaign_data(client, audience_df):
     """
@@ -324,18 +328,18 @@ def analyze_campaign_data(client, audience_df):
     try:
         # Clean and validate the audience data
         audience_df = clean_audience_data(audience_df)
-        
+
         # Get all unique user IDs
         user_ids = audience_df['User ID'].unique().tolist()
         total_users = len(user_ids)
-        
+
         if not user_ids:
             raise ValueError("No valid user IDs found in the data")
-        
+
         # Get the overall date range needed
         min_sent_date = audience_df['Sent Date'].min() - timedelta(days=7)
-        max_sent_date = audience_df['Sent Date'].max() + timedelta(days=7)
-        
+        max_sent_date = audience_df['Sent Date'].max() + timedelta(days=3)
+
         # First, identify users who came from social/google during campaign period using the exact query
         social_query = """
         WITH `google_marketing` as (
@@ -471,7 +475,7 @@ def analyze_campaign_data(client, audience_df):
         AND session_timestamp BETWEEN @min_date AND @max_date
         AND user_id IN UNNEST(@user_ids)
         """
-        
+
         job_config = bigquery.QueryJobConfig(
             query_parameters=[
                 bigquery.ArrayQueryParameter("user_ids", "STRING", user_ids),
@@ -479,74 +483,74 @@ def analyze_campaign_data(client, audience_df):
                 bigquery.ScalarQueryParameter("max_date", "TIMESTAMP", max_sent_date),
             ]
         )
-        
+
         # Get users who came from social/google
         social_users_df = client.query(social_query, job_config=job_config).to_dataframe()
         social_users = social_users_df['user_id'].tolist()
-        
+
         # Remove these users from our audience dataframe
         audience_df = audience_df[~audience_df['User ID'].isin(social_users)]
-        
+
         if len(social_users) > 0:
             st.warning(f"""
             ⚠️ Removed {len(social_users)} users who had both SMS and social/google attribution during the campaign period:
             - Original users in campaign: {total_users}
             - Users after removing social/google overlap: {len(audience_df)}
             """)
-        
+
         # Update user_ids list after removing social users
         user_ids = audience_df['User ID'].unique().tolist()
-        
+
         if not user_ids:
             st.warning("No users remaining after removing social/google overlap")
             return pd.DataFrame()
-            
+
         # First, verify which users exist in retail_user_activity
         verification_query = """
         SELECT DISTINCT client_id
         FROM reporting.retail_user_activity
         WHERE client_id IN UNNEST(@user_ids)
         """
-        
+
         job_config = bigquery.QueryJobConfig(
             query_parameters=[
                 bigquery.ArrayQueryParameter("user_ids", "STRING", user_ids),
             ]
         )
-        
+
         existing_users_df = client.query(verification_query, job_config=job_config).to_dataframe()
         existing_user_ids = existing_users_df['client_id'].tolist()
         missing_user_ids = list(set(user_ids) - set(existing_user_ids))
-        
+
         if missing_user_ids:
             st.warning(f"""
             ⚠️ {len(missing_user_ids)} users from your audience file were not found in the activity data:
             - Total users in file: {total_users}
             - Users found in activity data: {len(existing_user_ids)}
             - Users missing: {len(missing_user_ids)}
-            
+
             This could be because:
             1. These users have no activity in the system
             2. The User IDs might be in a different format
             3. The users might be too new or too old
-            
+
             First few missing User IDs: {missing_user_ids[:5]}
             """)
-        
+
         # First, get all possible action types
         action_types_query = """
         SELECT DISTINCT action_name
         FROM reporting.retail_user_activity
         """
-        
+
         action_types_df = client.query(action_types_query).to_dataframe()
         all_possible_actions = action_types_df['action_name'].tolist()
-        
+
         st.info(f"""
         📊 Action Types Found: {len(all_possible_actions)}
         {', '.join(all_possible_actions)}
         """)
-        
+
         # Query all activity data at once with detailed information
         activity_query = """
         SELECT 
@@ -564,7 +568,7 @@ def analyze_campaign_data(client, audience_df):
         AND action_date BETWEEN @min_date AND @max_date
         GROUP BY client_id, action_date, action_name
         """
-        
+
         job_config = bigquery.QueryJobConfig(
             query_parameters=[
                 bigquery.ArrayQueryParameter("user_ids", "STRING", user_ids),
@@ -572,11 +576,11 @@ def analyze_campaign_data(client, audience_df):
                 bigquery.ScalarQueryParameter("max_date", "TIMESTAMP", max_sent_date),
             ]
         )
-        
+
         # Load all activity data
         with st.spinner("Loading activity data..."):
             activity_df = client.query(activity_query, job_config=job_config).to_dataframe()
-        
+
         if activity_df.empty:
             st.warning("No activity data found for the specified users and date range")
             # Create empty results for all users to show they were processed
@@ -597,20 +601,20 @@ def analyze_campaign_data(client, audience_df):
                     result[f'{action} (Change)'] = 0
                 results.append(result)
             return pd.DataFrame(results)
-        
+
         # Track processed users
         processed_users = set()
         results = []
-        
+
         # Get booking attribution data
         with st.spinner("Loading booking attribution data..."):
             booking_df = get_booking_attribution(
-                client, 
-                user_ids, 
+                client,
+                user_ids,
                 min_sent_date,
                 max_sent_date
             )
-        
+
         if not booking_df.empty:
             st.info(f"""
             📊 Booking Attribution Summary:
@@ -618,48 +622,48 @@ def analyze_campaign_data(client, audience_df):
             - Users with Bookings: {booking_df['client_id'].nunique()}
             - Attribution Channels: {', '.join(booking_df['PM_source_attribution'].unique())}
             """)
-        
+
         # Process each user
         for _, row in audience_df.iterrows():
             user_id = row['User ID']
             sent_date = row['Sent Date']
             processed_users.add(user_id)
-            
+
             # Calculate date ranges
             before_start = sent_date - timedelta(days=7)  # 7 days before message
             before_end = sent_date  # Up to message time
             after_start = sent_date  # From message time
             after_end = sent_date + timedelta(days=7)  # 7 days after message
-            
+
             # Filter activity data for this user
             user_activity = activity_df[activity_df['client_id'] == user_id].copy()
             user_activity['action_date'] = pd.to_datetime(user_activity['action_date'])
-            
+
             # Get before period data
             before_data = user_activity[
-                (user_activity['action_date'] >= before_start) & 
+                (user_activity['action_date'] >= before_start) &
                 (user_activity['action_date'] <= before_end)
-            ]
-            
+                ]
+
             # Get after period data
             after_data = user_activity[
-                (user_activity['action_date'] >= after_start) & 
+                (user_activity['action_date'] >= after_start) &
                 (user_activity['action_date'] <= after_end)
-            ]
-            
+                ]
+
             # Get user's booking data
             user_bookings = booking_df[booking_df['client_id'] == user_id].copy()
             user_bookings['booking_created_at'] = pd.to_datetime(user_bookings['booking_created_at'])
-            
+
             # Split bookings into before/after
             before_bookings = user_bookings[
                 user_bookings['booking_created_at'] <= before_end
-            ]
+                ]
             after_bookings = user_bookings[
-                (user_bookings['booking_created_at'] > after_start) & 
+                (user_bookings['booking_created_at'] > after_start) &
                 (user_bookings['booking_created_at'] <= after_end)
-            ]
-            
+                ]
+
             # Prepare results
             result = {
                 'User ID': user_id,
@@ -671,16 +675,18 @@ def analyze_campaign_data(client, audience_df):
                 'Total Bookings': len(user_bookings),
                 'Bookings Before': len(before_bookings),
                 'Bookings After': len(after_bookings),
-                'Attribution Before': before_bookings['PM_source_attribution'].iloc[0] if not before_bookings.empty else 'None',
-                'Attribution After': after_bookings['PM_source_attribution'].iloc[0] if not after_bookings.empty else 'None'
+                'Attribution Before': before_bookings['PM_source_attribution'].iloc[
+                    0] if not before_bookings.empty else 'None',
+                'Attribution After': after_bookings['PM_source_attribution'].iloc[
+                    0] if not after_bookings.empty else 'None'
             }
-            
+
             # Initialize counts for all possible actions
             for action in all_possible_actions:
                 result[f'{action} (Before)'] = 0
                 result[f'{action} (After)'] = 0
                 result[f'{action} (Change)'] = 0
-            
+
             # Calculate metrics for actual actions in before period
             if not before_data.empty:
                 for action_name, group in before_data.groupby('action_name'):
@@ -690,7 +696,7 @@ def analyze_campaign_data(client, audience_df):
                         result[f'{action_name}_cars_before'] = group['car_names'].iloc[0]
                         result[f'{action_name}_makes_before'] = group['makes'].iloc[0]
                         result[f'{action_name}_models_before'] = group['models'].iloc[0]
-            
+
             # Calculate metrics for actual actions in after period
             if not after_data.empty:
                 for action_name, group in after_data.groupby('action_name'):
@@ -700,15 +706,15 @@ def analyze_campaign_data(client, audience_df):
                         result[f'{action_name}_cars_after'] = group['car_names'].iloc[0]
                         result[f'{action_name}_makes_after'] = group['makes'].iloc[0]
                         result[f'{action_name}_models_after'] = group['models'].iloc[0]
-            
+
             # Calculate changes for all actions
             for action in all_possible_actions:
                 before_count = result.get(f'{action} (Before)', 0)
                 after_count = result.get(f'{action} (After)', 0)
                 result[f'{action} (Change)'] = after_count - before_count
-            
+
             results.append(result)
-        
+
         # Add any missing users with empty data
         missing_users = set(user_ids) - processed_users
         for user_id in missing_users:
@@ -727,9 +733,9 @@ def analyze_campaign_data(client, audience_df):
                 result[f'{action} (After)'] = 0
                 result[f'{action} (Change)'] = 0
             results.append(result)
-        
+
         results_df = pd.DataFrame(results)
-        
+
         # Add summary of data status
         status_counts = results_df['Data Status'].value_counts()
         st.info(f"""
@@ -737,7 +743,7 @@ def analyze_campaign_data(client, audience_df):
         Total Users: {len(results_df)}
         {status_counts.to_string()}
         """)
-        
+
         # Add summary columns for important metrics
         results_df['Total Actions Before'] = sum(
             results_df[col] for col in results_df.columns if col.endswith('(Before)')
@@ -746,7 +752,7 @@ def analyze_campaign_data(client, audience_df):
             results_df[col] for col in results_df.columns if col.endswith('(After)')
         )
         results_df['Total Action Change'] = results_df['Total Actions After'] - results_df['Total Actions Before']
-        
+
         # Calculate engagement score
         action_weights = {
             'financing_request': 5,
@@ -755,32 +761,26 @@ def analyze_campaign_data(client, audience_df):
             'car_viewed': 1,
             'search_performed': 1
         }
-        
-        # Initialize engagement score columns
-        results_df['Engagement Score (Before)'] = 0
-        results_df['Engagement Score (After)'] = 0
-        
-        # Calculate engagement scores for each user
-        for action, weight in action_weights.items():
-            before_col = f'{action} (Before)'
-            after_col = f'{action} (After)'
-            
-            if before_col in results_df.columns:
-                results_df['Engagement Score (Before)'] += results_df[before_col] * weight
-            
-            if after_col in results_df.columns:
-                results_df['Engagement Score (After)'] += results_df[after_col] * weight
-        
-        # Calculate the change in engagement score
-        results_df['Engagement Score Change'] = results_df['Engagement Score (After)'] - results_df['Engagement Score (Before)']
-        
+
+        for period in ['Before', 'After']:
+            score = 0
+            for action, weight in action_weights.items():
+                col_name = f'{action} ({period})'
+                if col_name in results_df.columns:
+                    score += results_df[col_name] * weight
+            results_df[f'Engagement Score ({period})'] = score
+
+        results_df['Engagement Score Change'] = (
+                results_df['Engagement Score (After)'] - results_df['Engagement Score (Before)']
+        )
+
         # Add booking analysis
         if not booking_df.empty:
             # Attribution distribution
             st.subheader("Booking Attribution Analysis")
-            
+
             col1, col2 = st.columns(2)
-            
+
             with col1:
                 # Before campaign
                 before_attribution = results_df['Attribution Before'].value_counts()
@@ -790,7 +790,7 @@ def analyze_campaign_data(client, audience_df):
                     title="Attribution Distribution (Before Campaign)"
                 )
                 st.plotly_chart(fig1)
-            
+
             with col2:
                 # After campaign
                 after_attribution = results_df['Attribution After'].value_counts()
@@ -800,7 +800,7 @@ def analyze_campaign_data(client, audience_df):
                     title="Attribution Distribution (After Campaign)"
                 )
                 st.plotly_chart(fig2)
-            
+
             # Attribution changes
             st.subheader("Attribution Changes")
             attribution_changes = pd.crosstab(
@@ -809,12 +809,13 @@ def analyze_campaign_data(client, audience_df):
                 margins=True
             )
             st.dataframe(attribution_changes)
-        
+
         return results_df
-    
+
     except Exception as e:
         st.error(f"Error in analyze_campaign_data: {str(e)}")
         raise
+
 
 def main():
     st.set_page_config(
@@ -841,7 +842,7 @@ def main():
 
     # File upload
     uploaded_file = st.file_uploader("Upload Campaign Audience CSV", type=['csv'])
-    
+
     if uploaded_file is not None:
         try:
             # Show sample format
@@ -851,14 +852,14 @@ def main():
             - Optional columns: 'Latest Message Status', 'Total Clicks', 'Total Conversions'
             - Date format example: '09 Apr '25, 17:12 EET' or 'YYYY-MM-DD'
             """)
-            
+
             # Read the CSV file
             audience_df = pd.read_csv(uploaded_file)
-            
+
             # Display raw data
             st.subheader("Raw Data Preview")
             st.dataframe(audience_df.head())
-            
+
             # Get BigQuery credentials
             try:
                 credentials = service_account.Credentials.from_service_account_info(
@@ -872,24 +873,24 @@ def main():
                 except FileNotFoundError:
                     st.error("No credentials found for BigQuery access")
                     return
-            
+
             # Create BigQuery client
             client = bigquery.Client(credentials=credentials)
-            
+
             # Analyze the data
             with st.spinner("Analyzing campaign data..."):
                 results_df = analyze_campaign_data(client, audience_df)
-            
+
             if results_df.empty:
                 st.warning("No results to display")
                 return
-            
+
             # Display results
             st.subheader("Campaign Analysis Results")
-            
+
             # Summary metrics
             col1, col2, col3, col4 = st.columns(4)
-            
+
             with col1:
                 st.metric("Total Users", len(results_df))
             with col2:
@@ -901,36 +902,36 @@ def main():
             with col4:
                 avg_engagement_change = results_df['Engagement Score Change'].mean()
                 st.metric("Avg Engagement Change", f"{avg_engagement_change:.1f}")
-            
+
             # Action metrics
             st.subheader("Action Metrics")
-            
+
             # Create tabs for different types of analysis
             tab1, tab2, tab3 = st.tabs(["General Actions", "Important Actions", "Engagement Analysis"])
-            
+
             with tab1:
                 # Get all action columns
                 action_columns = [col for col in results_df.columns if '(Change)' in col]
-                
+
                 for action_col in action_columns:
                     action_name = action_col.replace(' (Change)', '')
                     total_before = results_df[f'{action_name} (Before)'].sum()
                     total_after = results_df[f'{action_name} (After)'].sum()
                     change = results_df[action_col].sum()
                     change_pct = ((total_after - total_before) / total_before * 100) if total_before > 0 else 0
-                    
+
                     st.metric(
                         action_name,
                         f"{total_after:,} (After) vs {total_before:,} (Before)",
                         f"{change:+,} ({change_pct:+.1f}%)"
                     )
-            
+
             with tab2:
                 important_actions = ['financing_request', 'test_drive_request', 'buy_now_request']
                 for action in important_actions:
                     if f'{action} (Before)' in results_df.columns:
                         st.subheader(f"{action.replace('_', ' ').title()}")
-                        
+
                         # Show metrics
                         col1, col2 = st.columns(2)
                         with col1:
@@ -941,7 +942,7 @@ def main():
                                 f"{total_after:,} (After) vs {total_before:,} (Before)",
                                 f"{total_after - total_before:+,}"
                             )
-                        
+
                         with col2:
                             # Show most common makes/models
                             if f'{action}_makes_after' in results_df.columns:
@@ -949,7 +950,7 @@ def main():
                                 if not makes_after.empty:
                                     st.write("Most Common Makes (After):")
                                     st.write(makes_after.value_counts().head())
-            
+
             with tab3:
                 # Show engagement score distribution
                 fig = px.histogram(
@@ -958,16 +959,16 @@ def main():
                     title='Distribution of Engagement Score Changes'
                 )
                 st.plotly_chart(fig)
-                
+
                 # Show average engagement by message status
                 avg_engagement = results_df.groupby('Message Status')['Engagement Score Change'].mean()
                 st.write("Average Engagement Change by Message Status:")
                 st.write(avg_engagement)
-            
+
             # Detailed results table
             st.subheader("Detailed Results")
             st.dataframe(results_df)
-            
+
             # Download results
             csv = results_df.to_csv(index=False)
             st.download_button(
@@ -977,9 +978,10 @@ def main():
                 "text/csv",
                 key='download-csv'
             )
-            
+
         except Exception as e:
             st.error(f"Error analyzing campaign data: {str(e)}")
 
+
 if __name__ == "__main__":
-    main() 
+    main()
