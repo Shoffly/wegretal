@@ -338,7 +338,7 @@ def analyze_campaign_data(client, audience_df):
 
         # Get the overall date range needed
         min_sent_date = audience_df['Sent Date'].min() - timedelta(days=7)
-        max_sent_date = audience_df['Sent Date'].max() + timedelta(days=3)
+        max_sent_date = audience_df['Sent Date'].max() + timedelta(days=7)
 
         # First, identify users who came from social/google during campaign period using the exact query
         social_query = """
